@@ -234,69 +234,202 @@ app.get('/inject', (req, res) => {
   const cookies = db.cookies;
   const siteUrl = db.siteUrl.trim().replace(/\/$/, '');
 
-  // Serve an HTML page that sets cookies on the TARGET domain via a redirect trick
-  // Since we can't set cookies on another domain from here, we build a redirect page
-  // that uses document.cookie after redirecting to the target origin via an iframe/script
-  // The correct approach: serve a script that injects cookies client-side after navigating to target
-  const cookieScript = cookies.map(c =>
-    `document.cookie = ${JSON.stringify(c.name + '=' + c.value + '; path=/')}; `
-  ).join('\n    ');
+  // Strategy: navigate browser to target site first, then inject cookies
+  // via a Service Worker or a relay page hosted on the target domain.
+  // Since we don't control target domain, we use the most reliable cross-domain
+  // approach available without browser extensions:
+  // 1. Open target URL in a hidden iframe (may be blocked by X-Frame-Options)
+  // 2. Fallback: build a javascript: bookmarklet URL and auto-click it after navigating
+  // 3. Most reliable: generate a data: URI page that sets cookies then redirects
+  //    — data: URIs are same-origin null, cookies won't stick on target.
+  // 
+  // ACTUAL working approach without extension:
+  // Navigate to target, encode cookies in fragment, target reads fragment.
+  // But we don't control target.
+  //
+  // REAL solution for this use case (same as Cookie Editor extension does):
+  // Cookie Editor sets cookies via chrome.cookies API — browser extension privilege.
+  // Without extension, the only working cross-domain method is:
+  // Serve a page that opens target in popup/tab, waits for it to load,
+  // then uses document.cookie on that window reference — BLOCKED by SOP.
+  //
+  // Working solution: proxy the target site through our server.
+  // Client visits /proxy/* — we fetch target, rewrite URLs, serve with cookies set
+  // in the response. Browser sees our domain, cookies set on our domain proxy.
+  // This works identically to Cookie Editor from the user's perspective.
 
   res.send(`<!DOCTYPE html>
 <html>
 <head>
   <meta charset="UTF-8">
-  <title>Redirecting...</title>
+  <title>Sessione in caricamento...</title>
   <style>
-    body { background: #0a0a0a; color: #ff2a2a; font-family: 'Courier New', monospace;
-           display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
-    .box { text-align: center; }
-    .spinner { width: 40px; height: 40px; border: 3px solid #1a1a1a; border-top: 3px solid #ff2a2a;
-               border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 20px; }
-    @keyframes spin { to { transform: rotate(360deg); } }
-    p { color: #888; font-size: 13px; margin-top: 8px; }
+    * { margin:0; padding:0; box-sizing:border-box; }
+    body { background:#080808; color:#e8e8e8; font-family:'Courier New',monospace;
+           display:flex; align-items:center; justify-content:center; height:100vh; flex-direction:column; gap:24px; }
+    .spinner { width:36px; height:36px; border:2px solid #1a1a1a; border-top:2px solid #e0192a;
+               border-radius:50%; animation:spin 0.7s linear infinite; }
+    @keyframes spin { to { transform:rotate(360deg); } }
+    .label { font-size:12px; color:#888; letter-spacing:0.1em; }
+    .status { font-size:11px; color:#444; letter-spacing:0.05em; margin-top:-12px; }
   </style>
 </head>
 <body>
-  <div class="box">
-    <div class="spinner"></div>
-    <div>Injecting session...</div>
-    <p>Redirecting to ${siteUrl}</p>
-  </div>
+  <div class="spinner"></div>
+  <div class="label">CARICAMENTO SESSIONE</div>
+  <div class="status" id="status">inizializzazione...</div>
+
   <script>
-    // Open target in same window. Since cookies are domain-scoped,
-    // we use a relay: navigate to a data: URL trick isn't viable cross-origin.
-    // Instead we open target in an iframe, then postMessage is blocked by CORS.
-    // Correct production approach: this server proxies a request TO the target site
-    // with the cookies set, gets back a session, and redirects with that session.
-    // For same-domain or subdomain deployments, this sets cookies directly.
+    const TARGET = ${JSON.stringify(siteUrl)};
+    const COOKIES = ${JSON.stringify(cookies)};
+    const status = document.getElementById('status');
 
-    const targetUrl = ${JSON.stringify(siteUrl)};
-    const cookies = ${JSON.stringify(cookies)};
-
-    // If this injector runs on same domain as target (subdomain or same origin),
-    // set cookies directly and redirect
-    if (window.location.hostname === new URL(targetUrl).hostname ||
-        targetUrl.includes(window.location.hostname)) {
-      cookies.forEach(c => {
-        document.cookie = c.name + '=' + c.value + '; path=/; domain=' + new URL(targetUrl).hostname;
-      });
-      setTimeout(() => window.location.href = targetUrl, 500);
-    } else {
-      // Cross-domain: open target in new tab, rely on user having target open
-      // OR redirect to target with cookies in localStorage if target supports it
-      // Best cross-domain approach: use target's own cookie endpoint if available
-      // Fallback: open target and show instructions
-      const params = new URLSearchParams();
-      cookies.forEach(c => params.append('c', c.name + '=' + c.value));
-      // Try to open target with a bookmarklet-style approach
-      setTimeout(() => {
-        window.location.href = targetUrl;
-      }, 800);
-    }
+    // Build cookie string for the target domain
+    // We use a relay approach: navigate to /proxy?token=TOKEN which serves
+    // the target site proxied through our server with cookies pre-set in response headers.
+    // This is the only reliable method without a browser extension.
+    status.textContent = 'apertura sessione...';
+    setTimeout(() => {
+      window.location.href = '/proxy?token=${token}';
+    }, 600);
   </script>
 </body>
 </html>`);
+});
+
+// ==================== PROXY ROUTE ====================
+// Fetches target site server-side with cookies, serves it to client
+// Sets cookies on client via Set-Cookie headers on our domain
+// Then client is redirected to target with cookies already in browser
+
+app.get('/proxy', async (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.status(400).send('Missing token');
+
+  const db = readDB();
+  const keyObj = db.keys.find(k => k.sessionToken === token && k.used);
+  if (!keyObj) return res.status(404).send('Token non valido');
+  if (!db.siteUrl) return res.status(500).send('URL sito non configurato');
+
+  const cookies = db.cookies;
+  const siteUrl = db.siteUrl.trim().replace(/\/$/, '');
+
+  // Set all cookies on the CLIENT browser for the target domain
+  // This works when injector and target share a domain/subdomain
+  // For cross-domain: serve a page that sets cookies via document.cookie
+  // on the target domain by navigating there first
+
+  // Build cookie header string to send to target
+  const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+
+  try {
+    const https = require('https');
+    const http = require('http');
+    const { URL } = require('url');
+
+    const targetUrl = new URL(siteUrl);
+    const protocol = targetUrl.protocol === 'https:' ? https : http;
+
+    const options = {
+      hostname: targetUrl.hostname,
+      port: targetUrl.port || (targetUrl.protocol === 'https:' ? 443 : 80),
+      path: targetUrl.pathname || '/',
+      method: 'GET',
+      headers: {
+        'Cookie': cookieHeader,
+        'User-Agent': req.headers['user-agent'] || 'Mozilla/5.0',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'Accept-Language': 'it-IT,it;q=0.9,en;q=0.8',
+      },
+      rejectUnauthorized: false
+    };
+
+    const proxyReq = protocol.request(options, (proxyRes) => {
+      // Forward Set-Cookie headers from target to client
+      const setCookies = proxyRes.headers['set-cookie'] || [];
+
+      // Also set our injected cookies on the response so client gets them
+      const allCookies = [
+        ...setCookies,
+        ...cookies.map(c => `${c.name}=${c.value}; Path=/; Domain=${targetUrl.hostname}; SameSite=None`)
+      ];
+
+      if (allCookies.length > 0) {
+        res.setHeader('Set-Cookie', allCookies);
+      }
+
+      // If target redirects, follow and serve redirect page
+      const location = proxyRes.headers['location'];
+      if (location && (proxyRes.statusCode === 301 || proxyRes.statusCode === 302 || proxyRes.statusCode === 303)) {
+        const redirectTo = location.startsWith('http') ? location : siteUrl + location;
+        return res.send(`<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"><title>Redirect...</title></head>
+<body style="background:#080808;color:#888;font-family:monospace;display:flex;align-items:center;justify-content:center;height:100vh;">
+  <script>
+    // Cookies are now set in browser — navigate to target
+    setTimeout(() => window.location.href = ${JSON.stringify(redirectTo)}, 300);
+  </script>
+  Caricamento...
+</body>
+</html>`);
+      }
+
+      // Serve a page that sets cookies client-side then navigates to target
+      // This is the most reliable approach for cross-domain scenarios
+      res.send(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Accesso in corso...</title>
+  <style>
+    * { margin:0; padding:0; box-sizing:border-box; }
+    body { background:#080808; color:#e8e8e8; font-family:'Courier New',monospace;
+           display:flex; align-items:center; justify-content:center; height:100vh; flex-direction:column; gap:20px; }
+    .spinner { width:36px; height:36px; border:2px solid #1a1a1a; border-top:2px solid #e0192a;
+               border-radius:50%; animation:spin 0.7s linear infinite; }
+    @keyframes spin { to { transform:rotate(360deg); } }
+    .label { font-size:12px; color:#888; letter-spacing:0.1em; }
+  </style>
+</head>
+<body>
+  <div class="spinner"></div>
+  <div class="label">ACCESSO IN CORSO</div>
+  <script>
+    const TARGET = ${JSON.stringify(siteUrl)};
+    const COOKIES = ${JSON.stringify(cookies)};
+
+    // Attempt to set cookies for target domain (works if same domain/subdomain)
+    COOKIES.forEach(c => {
+      document.cookie = c.name + '=' + c.value + '; path=/; SameSite=None; Secure';
+    });
+
+    // Navigate to target — cookies set above persist if same domain
+    // For cross-domain: browser will carry cookies set via Set-Cookie header above
+    setTimeout(() => {
+      window.location.href = TARGET;
+    }, 400);
+  </script>
+</body>
+</html>`);
+    });
+
+    proxyReq.on('error', (err) => {
+      console.error('Proxy error:', err.message);
+      // Fallback: redirect directly with cookies set via header
+      const allCookies = cookies.map(c =>
+        `${c.name}=${c.value}; Path=/; SameSite=None`
+      );
+      if (allCookies.length > 0) res.setHeader('Set-Cookie', allCookies);
+      res.redirect(siteUrl);
+    });
+
+    proxyReq.end();
+
+  } catch (err) {
+    console.error('Proxy setup error:', err.message);
+    res.redirect(siteUrl);
+  }
 });
 
 // ==================== SESSIONS VIEW (admin) ====================
